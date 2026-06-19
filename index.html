@@ -293,7 +293,18 @@ input[type=range]{flex:1;accent-color:var(--green);cursor:pointer}
         <div class="v-heard" id="vHeard"></div>
         <button class="mic-btn" id="micBtn" onclick="toggleListen()">🎤</button>
         <div class="v-st" id="vSt">Tryck på mikrofonen och säg bokstaven</div>
-        <div class="v-hint">Säg t.ex. <b style="color:var(--amber)">Alpha</b>, <b style="color:var(--amber)">Bravo</b> (NATO) eller bokstavens namn på svenska/engelska.</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:2px">
+          <small style="font-size:10px;color:var(--muted)">Igenkänningsspråk</small>
+          <button class="toggle on" id="langToggle" onclick="toggleVoiceLang()">SVENSKA</button>
+        </div>
+        <div class="v-hint" style="margin-bottom:10px">
+          Säg t.ex. <b style="color:var(--amber)">B</b> eller <b style="color:var(--amber)">Bravo</b> om rätt svar är B.
+          Enstaka bokstäver och NATO-ord fungerar båda. Testa det andra språkläget ovan om igenkänningen missar ofta.
+        </div>
+        <div style="width:100%;text-align:left">
+          <div class="lbl" style="margin-bottom:6px">NATO fonetiskt alfabet</div>
+          <div id="natoTable" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:3px 8px"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -662,6 +673,8 @@ async function playCurrentSignal(){
 
 // ══════════════════════════════════════
 // ANSWER (letter mode)
+// Core logic separated from button DOM so voice mode
+// can trigger answers without a real <button> element.
 // ══════════════════════════════════════
 async function answer(ch, btn){
   if(waiting) return;
@@ -673,16 +686,19 @@ async function answer(ch, btn){
   clearSig();
 
   const code=MORSE[curChar];
-  if(ch===curChar){
-    btn.classList.add('ok');
-    const mn=MNEMO[curChar]?`<br><span style="font-size:10px;color:var(--muted);font-family:Inter">${curChar}: ${MNEMO[curChar]}</span>`:'';
+  const isCorrect = (ch===curChar);
+
+  if(btn) btn.classList.add(isCorrect?'ok':'no');
+  if(!isCorrect){
+    document.querySelectorAll('.ans').forEach(b=>{ if(b.textContent===curChar) b.classList.add('ok'); });
+  }
+
+  const mn=MNEMO[curChar]?`<br><span style="font-size:10px;color:var(--muted);font-family:Inter">${curChar}: ${MNEMO[curChar]}</span>`:'';
+  if(isCorrect){
     fb.innerHTML=`✓ RÄTT!${mn}`; fb.className='fb ok';
     streak++; correct++; charStats[curChar].c++;
   } else {
-    btn.classList.add('no');
-    document.querySelectorAll('.ans').forEach(b=>{ if(b.textContent===curChar) b.classList.add('ok'); });
-    const mn=MNEMO[curChar]?`<br><span style="font-size:10px;color:var(--muted);font-family:Inter">${curChar}: ${MNEMO[curChar]}</span>`:'';
-    fb.innerHTML=`✗ Det var ${curChar} (${code})${mn}`; fb.className='fb no';
+    fb.innerHTML=`✗ Du sa "${ch}" — rätt svar var ${curChar} (${code})${mn}`; fb.className='fb no';
     streak=0; wrong++; charStats[curChar].w++;
   }
 
@@ -691,6 +707,11 @@ async function answer(ch, btn){
   document.getElementById('stW').textContent=wrong;
   document.getElementById('stS').textContent=streak;
   updateWeak();
+
+  // Voice-mode status line mirrors the real result
+  if(ansMode==='voice'){
+    setVSt(isCorrect ? `✓ Rätt! Det var ${curChar}` : `✗ Fel — rätt svar: ${curChar}`, isCorrect?'ok':'no');
+  }
 
   await new Promise(r=>setTimeout(r,1400));
 
@@ -703,6 +724,10 @@ async function answer(ch, btn){
 
 function nextQ(){
   pickChar(); clearSig(); playingLetter=false;
+  if(ansMode==='voice'){
+    const he=document.getElementById('vHeard'); if(he) he.textContent='';
+    setVSt('Lyssnar…','hearing');
+  }
   setTimeout(()=>playCurrentSignal(), 200);
 }
 
@@ -1000,10 +1025,12 @@ function setStart(m){
 }
 
 function gotoTab(m){
-  // Cancel all ongoing audio
+  // Cancel all ongoing audio across every mode
   cancelLetter.cancelled=true; playingLetter=false;
   cancelSent.cancelled=true;   playingSent=false;
   cancelTrans.cancelled=true;  playingTrans=false;
+  waiting=false; // never leave letter-mode stuck mid-answer when switching away
+
   if(m!=='letter') voiceStop();
   curTab=m;
   document.getElementById('mL').style.display  =m==='letter'   ?'':'none';
@@ -1035,29 +1062,88 @@ function flashBtn(id){
 }
 
 // ══════════════════════════════════════
-// VOICE RECOGNITION
+// VOICE RECOGNITION  (robust version)
 // ══════════════════════════════════════
 const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
 let recog=null, voiceOn=false, ansMode='buttons';
+let voiceLang='sv-SE'; // sv-SE recognises lone Swedish letters far better than en-US
+let voiceBusy=false;   // true while an answer is being processed — blocks duplicate triggers
+let voiceRestartTimer=null;
 
+// Maps recognised words/letters → the actual character.
+// Single letters are matched first and take priority (see processVoice).
 const VMAP = {
-  'a':'A','b':'B','c':'C','d':'D','e':'E','f':'F','g':'G','h':'H',
-  'i':'I','j':'J','k':'K','l':'L','m':'M','n':'N','o':'O','p':'P',
-  'q':'Q','r':'R','s':'S','t':'T','u':'U','v':'V','w':'W','x':'X',
-  'y':'Y','z':'Z','å':'Å','ä':'Ä','ö':'Ö',
-  'koo':'K','el':'L','em':'M','en':'N','es':'S','oo':'O','vee':'V','eks':'X',
-  'alfa':'A','alpha':'A','bravo':'B','charlie':'C','delta':'D',
-  'echo':'E','foxtrot':'F','golf':'G','hotel':'H','india':'I',
-  'juliet':'J','juliett':'J','kilo':'K','lima':'L','mike':'M',
-  'november':'N','oscar':'O','papa':'P','quebec':'Q','romeo':'R',
-  'sierra':'S','tango':'T','uniform':'U','victor':'V','whiskey':'W',
-  'xray':'X','x-ray':'X','yankee':'Y','zulu':'Z',
+  // ── NATO words (primary — most reliable across browsers/languages) ──
+  'alfa':'A','alpha':'A','bravo':'B','charlie':'C','tjarli':'C',
+  'delta':'D','echo':'E','eko':'E','foxtrot':'F','golf':'G',
+  'hotel':'H','hotell':'H','india':'I','indien':'I','juliet':'J','juliett':'J',
+  'kilo':'K','lima':'L','mike':'M','mikael':'M','november':'N',
+  'oscar':'O','oskar':'O','papa':'P','pappa':'P','quebec':'Q','kvebeck':'Q',
+  'romeo':'R','sierra':'S','tango':'T','uniform':'U',
+  'victor':'V','viktor':'V','whiskey':'W','whisky':'W','wiski':'W',
+  'x-ray':'X','xray':'X','exray':'X','yankee':'Y','zulu':'Z',
+
+  // ── Common ASR mishearings of NATO words ──
+  'alfra':'A','alva':'A','alfar':'A',
+  'bravvo':'B','bravoo':'B',
+  'sharlie':'C','charlee':'C','charly':'C',
+  'deltah':'D','delter':'D',
+  'ecco':'E','ek':'E',
+  'fox trot':'F','fokstrot':'F','fakstrot':'F',
+  'gulf':'G','golv':'G',
+  'india':'I','indja':'I',
+  'juliett':'J','julia':'J',
+  'killo':'K','keelo':'K','kilogram':'K',
+  'leema':'L','liima':'L',
+  'majk':'M','mikrofon':'M',
+  'novemberr':'N',
+  'pappan':'P',
+  'romio':'R','romeoh':'R',
+  'sjarra':'S','siera':'S',
+  'tangoo':'T',
+  'juniform':'U',
+  'wiskey':'W','viskey':'W',
+  'jenkee':'Y','janke':'Y',
+  'zuloo':'Z','sulu':'Z',
+
+  // ── Swedish digit names ──
   'noll':'0','ett':'1','två':'2','tre':'3','fyra':'4',
   'fem':'5','sex':'6','sju':'7','åtta':'8','nio':'9',
+  // ── English digit names (in case lang falls back) ──
   'zero':'0','one':'1','two':'2','three':'3','four':'4',
   'five':'5','six':'6','seven':'7','eight':'8','nine':'9',
-  'åsa':'Å','ärta':'Ä','öra':'Ö','double u':'W'
 };
+
+// NATO alphabet with phonetic pronunciation guide, for the reference table
+const NATO_TABLE = [
+  ['A','Alfa','AL-fah'],        ['B','Bravo','BRAH-voh'],
+  ['C','Charlie','CHAR-lee'],   ['D','Delta','DEL-tah'],
+  ['E','Echo','ECK-oh'],        ['F','Foxtrot','FOKS-trot'],
+  ['G','Golf','GOLF'],          ['H','Hotel','hoh-TELL'],
+  ['I','India','IN-dee-ah'],    ['J','Juliet','JEW-lee-ett'],
+  ['K','Kilo','KEY-loh'],       ['L','Lima','LEE-mah'],
+  ['M','Mike','MIKE'],          ['N','November','no-VEM-ber'],
+  ['O','Oscar','OSS-kar'],      ['P','Papa','pah-PAH'],
+  ['Q','Quebec','keh-BECK'],    ['R','Romeo','ROH-mee-oh'],
+  ['S','Sierra','see-AIR-ah'],  ['T','Tango','TANG-go'],
+  ['U','Uniform','YOU-nee-form'],['V','Victor','VIK-tor'],
+  ['W','Whiskey','WISS-key'],   ['X','X-ray','ECKS-ray'],
+  ['Y','Yankee','YANG-key'],    ['Z','Zulu','ZOO-loo'],
+  ['Å','säg "Å"','OH (svenskt å)'],
+  ['Ä','säg "Ä"','EH (svenskt ä)'],
+  ['Ö','säg "Ö"','UH (svenskt ö)']
+];
+
+function buildNatoTable(){
+  const el=document.getElementById('natoTable'); if(!el) return;
+  el.innerHTML='';
+  NATO_TABLE.forEach(([letter,word,pron])=>{
+    const row=document.createElement('div');
+    row.style.cssText='font-family:Share Tech Mono,monospace;font-size:11px;color:var(--text);display:flex;gap:5px;align-items:baseline;min-width:150px';
+    row.innerHTML=`<b style="color:var(--green);min-width:16px">${letter}</b><span style="color:var(--amber)">${word}</span><span style="color:var(--muted);font-size:9px">(${pron})</span>`;
+    el.appendChild(row);
+  });
+}
 
 function setAnsMode(m){
   ansMode=m;
@@ -1066,65 +1152,204 @@ function setAnsMode(m){
   document.getElementById('ansPanel').style.display  =m==='buttons'?'':'none';
   document.getElementById('voicePanel').style.display=m==='voice'  ?'':'none';
   if(m==='voice'){
-    if(!SR){ document.getElementById('noSpeechMsg').style.display='';
-             document.getElementById('voiceUI').style.display='none'; return; }
-    initRecog(); if(!voiceOn) startVoice();
-  } else { stopVoice(); }
+    if(!SR){
+      document.getElementById('noSpeechMsg').style.display='';
+      document.getElementById('voiceUI').style.display='none';
+      return;
+    }
+    buildNatoTable();
+    initRecog();
+    if(!voiceOn) startVoice();
+  } else {
+    stopVoice();
+  }
 }
 
 function initRecog(){
   if(recog) return;
   recog=new SR();
-  recog.lang='sv-SE'; recog.continuous=true; recog.interimResults=false; recog.maxAlternatives=5;
-  recog.onstart =()=>{ voiceOn=true; micState(true);  setVSt('Lyssnar…','hearing'); };
-  recog.onend   =()=>{ if(ansMode==='voice'&&voiceOn){ try{recog.start();}catch(e){} }
-                       else{ voiceOn=false; micState(false); setVSt('Tryck på mikrofonen',''); } };
-  recog.onerror =e=>{ if(e.error==='no-speech') return;
-                      if(e.error==='not-allowed'){ voiceOn=false; setVSt('Mikrofon nekad','no'); } };
+  recog.lang=voiceLang;
+  recog.continuous=false;       // restart manually after each result — more reliable than continuous mode
+  recog.interimResults=false;
+  recog.maxAlternatives=10;     // many alternatives = much better match odds for single letters
+
+  recog.onstart=()=>{
+    voiceOn=true; micState(true); setVSt('Lyssnar…','hearing');
+  };
+
+  recog.onend=()=>{
+    micState(false);
+    // Auto-restart while still in voice mode, unless we're mid-answer
+    if(ansMode==='voice' && voiceOn && !voiceBusy){
+      clearTimeout(voiceRestartTimer);
+      voiceRestartTimer=setTimeout(()=>{ try{recog.start();}catch(e){} }, 150);
+    } else if(!voiceOn){
+      setVSt('Tryck på mikrofonen och säg bokstaven','');
+    }
+  };
+
+  recog.onerror=e=>{
+    if(e.error==='no-speech'||e.error==='aborted'){ return; } // just restart via onend
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){
+      voiceOn=false; setVSt('Mikrofon nekad — tillåt åtkomst i webbläsaren','no');
+    }
+    if(e.error==='network'){ setVSt('Nätverksfel — försöker igen…','no'); }
+  };
+
   recog.onresult=e=>{
-    if(waiting) return;
-    const res=e.results[e.resultIndex];
-    const cands=Array.from({length:res.length},(_,i)=>res[i].transcript.trim().toLowerCase());
+    if(voiceBusy||waiting) return;
+    const res=e.results[e.results.length-1];
+    const seen=new Set(), cands=[];
+    for(let i=0;i<res.length;i++){
+      const t=res[i].transcript.trim().toLowerCase();
+      if(t && !seen.has(t)){ seen.add(t); cands.push(t); }
+    }
     processVoice(cands);
   };
 }
 
-function startVoice(){ if(!SR) return; if(!recog) initRecog(); voiceOn=true; try{recog.start();}catch(e){} }
-function stopVoice() { voiceOn=false; if(recog) try{recog.stop();}catch(e){} micState(false); }
-function voicePause(){ if(voiceOn&&recog) try{recog.stop();}catch(e){} }
-function voiceResume(){ if(ansMode==='voice'&&voiceOn) setTimeout(()=>{ try{recog&&recog.start();}catch(e){} },300); }
-function voiceStop()  { stopVoice(); }
-function voiceResumeIfActive(){ if(ansMode==='voice'&&!voiceOn) setTimeout(()=>startVoice(),200); }
+function startVoice(){
+  if(!SR) return;
+  if(!recog) initRecog();
+  voiceOn=true;
+  clearTimeout(voiceRestartTimer);
+  try{ recog.start(); }catch(e){ /* already running */ }
+}
+
+function stopVoice(){
+  voiceOn=false;
+  clearTimeout(voiceRestartTimer);
+  if(recog) try{ recog.stop(); }catch(e){}
+  micState(false);
+}
+
+// Called by playCurrentSignal() to mute the mic while the morse beeps play
+function voicePause(){
+  if(voiceOn && recog) try{ recog.stop(); }catch(e){}
+}
+function voiceResume(){
+  if(ansMode==='voice' && voiceOn){
+    clearTimeout(voiceRestartTimer);
+    voiceRestartTimer=setTimeout(()=>{ try{recog&&recog.start();}catch(e){} }, 350);
+  }
+}
+function voiceStop(){ stopVoice(); }
+function voiceResumeIfActive(){
+  if(ansMode==='voice' && !voiceOn) setTimeout(()=>startVoice(), 200);
+}
 
 function micState(on){
   const btn=document.getElementById('micBtn'); if(!btn) return;
-  btn.classList.toggle('live',on); btn.textContent=on?'🔴':'🎤';
+  btn.classList.toggle('live',on);
+  btn.textContent=on?'🔴':'🎤';
 }
 function setVSt(msg,cls){
   const el=document.getElementById('vSt'); if(!el) return;
-  el.textContent=msg; el.className='v-st'+(cls?' '+cls:'');
+  el.textContent=msg;
+  el.className='v-st'+(cls?' '+cls:'');
 }
-function toggleListen(){ if(voiceOn){stopVoice();setVSt('Pausad','');}else startVoice(); }
+function toggleListen(){
+  if(voiceOn){ stopVoice(); setVSt('Pausad — tryck för att lyssna igen',''); }
+  else startVoice();
+}
+
+function toggleVoiceLang(){
+  voiceLang = (voiceLang==='sv-SE') ? 'en-US' : 'sv-SE';
+  const btn=document.getElementById('langToggle');
+  if(btn) btn.textContent = (voiceLang==='sv-SE') ? 'SVENSKA' : 'ENGELSKA';
+  // Recreate recognizer with new language
+  const wasOn=voiceOn;
+  stopVoice();
+  recog=null;
+  initRecog();
+  if(wasOn) startVoice();
+}
+
+function normalise(s){
+  return s.toLowerCase()
+    .replace(/[.,!?]/g,'')
+    .replace(/[^a-zåäö0-9\-\s]/g,'')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+// Try to extract a single A–Ö/0–9 character match from a transcript.
+// Priority: exact single letter > exact NATO/word match > first word match > substring fuzzy match.
+function matchChar(raw){
+  const c=normalise(raw);
+  if(!c) return null;
+
+  // 1. Whole transcript is exactly one letter or digit — highest confidence
+  if(/^[a-zåäö]$/.test(c)) return c.toUpperCase();
+  if(/^([0-9]|10)$/.test(c)) return c;
+
+  // 2. Whole transcript matches a known word exactly
+  if(VMAP[c]) return VMAP[c];
+
+  const words=c.split(' ');
+
+  // 3. First word matches
+  if(VMAP[words[0]]) return VMAP[words[0]];
+
+  // 4. First word is a lone letter (e.g. "b please" → "b")
+  if(/^[a-zåäö]$/.test(words[0])) return words[0].toUpperCase();
+
+  // 5. Any individual word in the phrase matches a known word
+  for(const w of words){ if(VMAP[w]) return VMAP[w]; }
+
+  // 6. Any individual word is a lone letter
+  for(const w of words){ if(/^[a-zåäö]$/.test(w)) return w.toUpperCase(); }
+
+  // 7. Strip common trailing artefacts ("bee" → already covered, "bees"→"bee")
+  const stripped=words[0].replace(/[sa]$/,'');
+  if(VMAP[stripped]) return VMAP[stripped];
+
+  // 8. Fuzzy substring — longest matching key wins
+  let best=null, bestLen=0;
+  for(const key of Object.keys(VMAP)){
+    if(key.length>2 && c.includes(key) && key.length>bestLen){ bestLen=key.length; best=VMAP[key]; }
+  }
+  return best;
+}
 
 function processVoice(cands){
-  if(waiting||!curChar) return;
+  if(voiceBusy||waiting||!curChar) return;
+
+  const he=document.getElementById('vHeard');
+  if(he) he.textContent=cands[0]?`"${cands[0]}"`:'';
+
   let matched=null;
   for(const raw of cands){
-    const c=raw.replace(/[^a-zåäö0-9\-\s]/g,'').trim();
-    if(VMAP[c]){matched=VMAP[c];break;}
-    const fw=c.split(/\s+/)[0];
-    if(VMAP[fw]){matched=VMAP[fw];break;}
-    if(/^[a-zåäö]$/i.test(c)){matched=c.toUpperCase();break;}
-    const stripped=fw.replace(/s$/,'');
-    if(VMAP[stripped]){matched=VMAP[stripped];break;}
+    matched=matchChar(raw);
+    if(matched) break;
   }
-  const he=document.getElementById('vHeard');
-  if(he) he.textContent=cands[0]?`"${cands[0]}"` :'';
-  if(!matched){ setVSt('Hörde inte — försök igen','no'); return; }
-  if(!selChars.has(matched)){ setVSt(`"${matched}" är inte bland valda tecken`,'no'); return; }
-  setVSt(`Hörde: ${matched}`,matched===curChar?'ok':'no');
+
+  if(!matched){
+    setVSt('Hörde inte tydligt — försök igen','no');
+    return;
+  }
+
+  if(!selChars.has(matched)){
+    setVSt(`"${matched}" är inte bland valda tecken — försök igen`,'no');
+    return;
+  }
+
+  // Lock out further recognition results until this answer is fully processed
+  voiceBusy=true;
+  clearTimeout(voiceRestartTimer);
+  if(recog) try{ recog.stop(); }catch(e){}
+
+  setVSt(matched===curChar ? `Hörde: ${matched} ✓` : `Hörde: ${matched}`, matched===curChar?'ok':'no');
+
+  // Trigger the same answer() flow buttons use — pass null btn since there may be none visible
   const btns=document.querySelectorAll('.ans');
-  for(const b of btns){ if(b.textContent===matched){ answer(matched,b); return; } }
+  let targetBtn=null;
+  for(const b of btns){ if(b.textContent===matched){ targetBtn=b; break; } }
+
+  answer(matched, targetBtn).then(()=>{
+    voiceBusy=false;
+    if(ansMode==='voice') voiceResumeIfActive();
+  });
 }
 
 // ══════════════════════════════════════
